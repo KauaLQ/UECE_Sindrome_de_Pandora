@@ -6,6 +6,8 @@
 #include <freertos/task.h>
 #include <freertos/queue.h>
 #include "HX711.h"
+#include <Wire.h>
+#include <Adafruit_AHTX0.h>
 
 // ---------- Configurações de rede ----------
 const char* WIFI_SSID     = "KAUA_LQ";
@@ -21,6 +23,13 @@ const int LOADCELL_SCK_PIN = 5;
 const float ZERO_THRESHOLD = 0.5; // Limiar para ignorar pequenas flutuações em torno de zero (em gramas)
 float calibration_factor = 420.0; // Fator de calibração inicial
 // -----------------
+
+// ----- AHT10 (temperatura e umidade, I2C) -----
+#define I2C_SDA_PIN 0
+#define I2C_SCL_PIN 1
+#define INTERVALO_LEITURA_AHT_MS 2000
+Adafruit_AHTX0 aht;
+// ----------------------------------------------
 
 // ---------- Presença do gato (histerese) ----------
 #define PESO_INICIO_GRAVACAO_G  200.0f  // acima disso: gato entrou -> começa a gravar
@@ -52,6 +61,7 @@ typedef struct {
 QueueHandle_t filaAudio;
 TaskHandle_t tarefaCapturaHandle;
 TaskHandle_t tarefaPesoHandle;
+TaskHandle_t tarefaTemperaturaHandle;
 
 WebSocketsClient webSocket;
 
@@ -90,6 +100,9 @@ void i2sInstalar() {
   };
 
   i2s_pin_config_t pins = {
+    // Sem esta linha o campo mck_io_num fica 0 e o driver passa a emitir o MCLK
+    // no GPIO0 (o INMP441 não usa MCLK). Aqui o GPIO0 é o SDA do I2C do AHT10.
+    .mck_io_num = I2S_PIN_NO_CHANGE,
     .bck_io_num = I2S_SCK_PIN,
     .ws_io_num = I2S_WS_PIN,
     .data_out_num = I2S_PIN_NO_CHANGE,
@@ -163,9 +176,40 @@ void tarefaPeso(void *parametro) {
       hxOk = true;
       pesoSeq++;
     } else {
-      hxOk = false; // sem resposta por 1 s: aí sim é desconexão de verdade
+      hxOk = false; // sem resposta por 1 s: desconexão de verdade
     }
     vTaskDelay(pdMS_TO_TICKS(1));
+  }
+}
+
+// ---------- Tarefa de leitura de temperatura/umidade (AHT10) ----------
+// Roda separada das demais: a conversão do AHT10 leva ~80 ms e não deve
+// atrasar o WebSocket nem a leitura da célula de carga.
+void tarefaTemperatura(void *parametro) {
+  bool sensorOk = false;
+
+  for (;;) {
+    if (!sensorOk) {
+      sensorOk = aht.begin(&Wire);
+      if (sensorOk) {
+        Serial.println("[AHT10] Sensor inicializado.");
+      } else {
+        Serial.println("[AHT10] Não encontrado. Verifique SDA/SCL, alimentação e endereço 0x38. Tentando novamente...");
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        continue;
+      }
+    }
+
+    sensors_event_t umidade, temperatura;
+    if (aht.getEvent(&umidade, &temperatura)) {
+      Serial.printf("[AHT10] Temperatura: %.1f °C | Umidade: %.1f %%\n",
+                    temperatura.temperature, umidade.relative_humidity);
+    } else {
+      Serial.println("[AHT10] Falha na leitura.");
+      sensorOk = false; // força reinicialização na próxima volta
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(INTERVALO_LEITURA_AHT_MS));
   }
 }
 
@@ -287,10 +331,7 @@ void tratarImpressaoPeso() {
   ultimo = millis();
 
   if (hxOk) {
-    Serial.print("Peso aferido: ");
-    Serial.print((float)pesoAtual, 2); // Exibe com 2 casas decimais
-    Serial.print(" g");
-    Serial.println(estado == GRAVANDO ? "  [GRAVANDO]" : "");
+    Serial.printf("Peso aferido: %.2f g%s\n", (float)pesoAtual, estado == GRAVANDO ? "  [GRAVANDO]" : "");
   } else {
     Serial.println("HX711 não encontrado ou desconectado.");
   }
@@ -310,6 +351,10 @@ void setup() {
   Serial.println("Tarando a balança... Mantenha-a vazia."); // Zera a balança (Tara).
   scale.tare();
   Serial.println("Balança pronta para uso!");
+
+  // ----- I2C / AHT10 -----
+  Wire.setPins(I2C_SDA_PIN, I2C_SCL_PIN);
+  Wire.begin();
 
   // ----- WiFi -----
   WiFi.mode(WIFI_STA);
@@ -332,6 +377,7 @@ void setup() {
   filaAudio = xQueueCreate(FILA_TAMANHO, sizeof(ChunkAudio));
   xTaskCreate(tarefaCapturaAudio, "CapturaAudio", 6144, NULL, 3, &tarefaCapturaHandle);
   xTaskCreate(tarefaPeso, "LeituraPeso", 4096, NULL, 1, &tarefaPesoHandle);
+  xTaskCreate(tarefaTemperatura, "LeituraTemp", 4096, NULL, 1, &tarefaTemperaturaHandle);
 
   // ----- WebSocket -----
   webSocket.begin(WS_HOST, WS_PORT, WS_PATH);
