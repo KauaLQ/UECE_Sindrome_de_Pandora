@@ -10,8 +10,8 @@
 #include "HX711.h"
 
 // ---------- Rede ----------
-const char* WIFI_SSID  = "KAUA_LQ";
-const char* WIFI_SENHA = "12345678";
+const char* WIFI_SSID  = "ssid";
+const char* WIFI_SENHA = "password";
 const char* WS_HOST    = "192.168.1.104"; // IP do PC rodando o server python
 const uint16_t WS_PORT = 8080;
 const char* WS_PATH    = "/ws/caixa_areia";

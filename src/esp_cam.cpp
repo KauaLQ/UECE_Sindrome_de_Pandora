@@ -19,8 +19,8 @@
 #include "esp_camera.h"
 
 // ====================== CONFIGURAÇÃO DO USUÁRIO ======================
-#define WIFI_SSID      "CLEUDO"
-#define WIFI_PASS      "91898487"
+#define WIFI_SSID      "ssid"
+#define WIFI_PASS      "password"
 #define TCP_PORT       5000
 
 #define FRAME_SIZE     FRAMESIZE_QVGA   // FRAMESIZE_QVGA (320x240) ou FRAMESIZE_VGA (640x480)
