@@ -1,11 +1,10 @@
 #include <Arduino.h>
 #include <WiFi.h>
-#include <WebSocketsClient.h>
+#include "esp_websocket_client.h"   // cliente WebSocket oficial do ESP-IDF (tarefa própria, thread-safe)
 #include <driver/i2s.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
-#include <freertos/semphr.h>
 #include <Wire.h>
 #include <Adafruit_AHTX0.h>
 #include "HX711.h"
@@ -13,9 +12,12 @@
 // ---------- Rede ----------
 const char* WIFI_SSID  = "KAUA_LQ";
 const char* WIFI_SENHA = "12345678";
-const char* WS_HOST    = "192.168.1.101"; // IP do PC rodando o server python
+const char* WS_HOST    = "192.168.1.104"; // IP do PC rodando o server python
 const uint16_t WS_PORT = 8080;
 const char* WS_PATH    = "/ws/caixa_areia";
+#define WS_PING_INTERVALO_S   5      // heartbeat: detecta conexão "morta" em poucos segundos
+#define WS_PING_TIMEOUT_S     10
+#define WS_TIMEOUT_ENVIO_MS   500    // quanto um envio pode esperar antes de ser considerado falha
 
 // ---------- HX711 ----------
 const int   LOADCELL_DOUT_PIN = 4;
@@ -45,9 +47,10 @@ const float CALIBRATION_FACTOR = 420.0;
 #define SAMPLE_RATE       16000
 #define AUDIO_SHIFT_BITS  14   // 16 = ganho unitário; 14 = +12 dB (com saturação)
 #define CANAL_OFFSET      0    // 0 = canal esquerdo (pino L/R do INMP441 no GND)
-#define CHUNK_AMOSTRAS    512
-#define FILA_AUDIO_TAMANHO 40
+#define CHUNK_AMOSTRAS    512  // 32 ms por chunk
+#define FILA_AUDIO_TAMANHO 64  // ~2 s de folga caso a rede engasgue
 #define FILA_PESO_TAMANHO  10
+#define ATRASO_STOP_MS     50  // espera o último chunk da captura chegar na fila antes do stop_audio
 
 typedef struct {
   int16_t dados[CHUNK_AMOSTRAS];
@@ -57,53 +60,127 @@ typedef struct {
 // ---------- Objetos compartilhados ----------
 HX711 scale;
 Adafruit_AHTX0 aht;
-WebSocketsClient webSocket;
+esp_websocket_client_handle_t wsClient = NULL;
 
-QueueHandle_t filaAudio;          // capturaAudio  -> gerenciamento (chunks PCM)
-QueueHandle_t filaPeso;           // peso          -> gerenciamento (float, em g)
-SemaphoreHandle_t wsMutex;        // WebSocketsClient não é thread-safe: todo acesso passa por aqui
+QueueHandle_t filaAudio;   // captura -> tarefaEnvioAudio
+QueueHandle_t filaPeso;    // peso    -> gerenciamento (float, em g)
 
-volatile bool gravando = false;       // lido pela tarefa de captura
-volatile bool wsConectado = false;    // atualizado pelo callback do WebSocket
-volatile bool wsNovaConexao = false;  // callback avisa que (re)conectou
+volatile bool gravando = false;             // gerenciamento escreve; captura e envio leem
+volatile bool wsConectado = false;          // atualizado pelo callback do WebSocket
+volatile uint32_t wsConexoes = 0;           // incrementa a cada (re)conexão
+volatile uint32_t fimGravacaoMs = 0;        // instante em que gravando virou false
+volatile uint32_t chunksDescartados = 0;    // diagnóstico: chunks perdidos por fila cheia
+volatile uint32_t falhasEnvio = 0;          // diagnóstico: chunks que a rede recusou
 
 enum EstadoCaixa { LIVRE, GRAVANDO };
 
 // ---------------------------------------------------------------------
-//  WebSocket
+//  WebSocket (esp_websocket_client)
 // ---------------------------------------------------------------------
-void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
-  switch (type) {
-    case WStype_CONNECTED:
+// O callback roda na tarefa interna do cliente: só atualiza flags e imprime.
+static void wsEventHandler(void *args, esp_event_base_t base, int32_t id, void *dados) {
+  esp_websocket_event_data_t *ev = (esp_websocket_event_data_t *)dados;
+  switch (id) {
+    case WEBSOCKET_EVENT_CONNECTED:
       Serial.println("[WS] Conectado ao servidor");
       wsConectado = true;
-      wsNovaConexao = true;
+      wsConexoes++;
       break;
-    case WStype_DISCONNECTED:
+    case WEBSOCKET_EVENT_DISCONNECTED:
       Serial.println("[WS] Desconectado do servidor");
       wsConectado = false;
       break;
-    case WStype_TEXT:
-      Serial.printf("[WS] Servidor: %.*s\n", (int)length, (char*)payload);
+    case WEBSOCKET_EVENT_ERROR:
+      Serial.println("[WS] Erro de conexão");
+      break;
+    case WEBSOCKET_EVENT_DATA:
+      if (ev->op_code == 0x01) { // texto
+        Serial.printf("[WS] Servidor: %.*s\n", ev->data_len, (const char *)ev->data_ptr);
+      }
       break;
     default:
       break;
   }
 }
 
-// Envios feitos fora do loop() passam pelo mutex, para não colidirem com webSocket.loop()
-void wsEnviarTXT(const char* texto) {
-  if (!wsConectado) return;
-  xSemaphoreTake(wsMutex, portMAX_DELAY);
-  webSocket.sendTXT(texto);
-  xSemaphoreGive(wsMutex);
+void wsIniciar() {
+  static char uri[96];
+  snprintf(uri, sizeof(uri), "ws://%s:%u%s", WS_HOST, WS_PORT, WS_PATH);
+
+  esp_websocket_client_config_t cfg = {};
+  cfg.uri = uri;
+  cfg.ping_interval_sec = WS_PING_INTERVALO_S;
+  cfg.pingpong_timeout_sec = WS_PING_TIMEOUT_S;
+
+  wsClient = esp_websocket_client_init(&cfg);
+  esp_websocket_register_events(wsClient, WEBSOCKET_EVENT_ANY, wsEventHandler, NULL);
+  esp_websocket_client_start(wsClient); // reconecta sozinho se o servidor/WiFi cair
 }
 
-void wsEnviarChunk(const ChunkAudio& chunk) {
-  if (!wsConectado || chunk.quantidade == 0) return;
-  xSemaphoreTake(wsMutex, portMAX_DELAY);
-  webSocket.sendBIN((const uint8_t*)chunk.dados, chunk.quantidade * sizeof(int16_t));
-  xSemaphoreGive(wsMutex);
+// Envios: o cliente tem lock interno, então podem ser feitos de qualquer tarefa.
+// Retornam true se a rede aceitou os dados.
+static bool wsEnviarTXT(const char *texto) {
+  return esp_websocket_client_send_text(wsClient, texto, strlen(texto),
+                                        pdMS_TO_TICKS(WS_TIMEOUT_ENVIO_MS)) >= 0;
+}
+
+static bool wsEnviarChunk(const ChunkAudio &chunk) {
+  return esp_websocket_client_send_bin(wsClient, (const char *)chunk.dados,
+                                       chunk.quantidade * sizeof(int16_t),
+                                       pdMS_TO_TICKS(WS_TIMEOUT_ENVIO_MS)) >= 0;
+}
+
+// ---------------------------------------------------------------------
+//  Envio do áudio: start_audio -> chunks -> stop_audio (ordem garantida,
+//  pois tudo sai desta única tarefa)
+// ---------------------------------------------------------------------
+void tarefaEnvioAudio(void *parametro) {
+  bool sessaoAberta = false;
+  uint32_t conexoesVistas = 0;
+  ChunkAudio chunk;
+
+  for (;;) {
+    // Houve (re)conexão: a sessão antiga não existe mais no servidor
+    if (conexoesVistas != wsConexoes) {
+      conexoesVistas = wsConexoes;
+      sessaoAberta = false;
+    }
+
+    if (!wsConectado) {
+      // Sem servidor: não acumula áudio velho para mandar depois da reconexão
+      if (gravando) xQueueReset(filaAudio);
+      vTaskDelay(pdMS_TO_TICKS(20));
+      continue;
+    }
+
+    if (gravando && !sessaoAberta) {
+      if (wsEnviarTXT("start_audio")) {
+        sessaoAberta = true;
+      } else {
+        vTaskDelay(pdMS_TO_TICKS(100)); // rede recusou: tenta de novo
+        continue;
+      }
+    }
+
+    if (!sessaoAberta) {
+      vTaskDelay(pdMS_TO_TICKS(20)); // nada para enviar
+      continue;
+    }
+
+    // Espera até 20 ms por um chunk (acorda assim que ele chega)
+    if (xQueueReceive(filaAudio, &chunk, pdMS_TO_TICKS(20)) == pdTRUE) {
+      if (chunk.quantidade > 0 && !wsEnviarChunk(chunk)) {
+        falhasEnvio++;
+      }
+    }
+
+    // Gravação terminou e a fila esvaziou: fecha a sessão
+    if (!gravando && uxQueueMessagesWaiting(filaAudio) == 0 && (millis() - fimGravacaoMs) > ATRASO_STOP_MS) {
+      if (wsEnviarTXT("stop_audio")) {
+        sessaoAberta = false;
+      }
+    }
+  }
 }
 
 // ---------------------------------------------------------------------
@@ -171,12 +248,13 @@ void tarefaCapturaAudio(void *parametro) {
       ChunkAudio descartado;
       xQueueReceive(filaAudio, &descartado, 0);
       xQueueSend(filaAudio, &chunk, 0);
+      chunksDescartados++;
     }
   }
 }
 
 // ---------------------------------------------------------------------
-//  Gerenciamento da caixa: máquina de estados + envio do áudio
+//  Gerenciamento da caixa: máquina de estados (sem I/O de rede)
 // ---------------------------------------------------------------------
 static EstadoCaixa estado = LIVRE;   // só esta tarefa lê/escreve
 static int contConfirmaEntrada = 0;
@@ -186,22 +264,19 @@ static void iniciarGravacao(float peso) {
   Serial.printf("[GATO] Entrou na caixa (%.1f g). Iniciando gravação.\n", peso);
   i2s_zero_dma_buffer(I2S_PORT);  // descarta áudio velho que ficou no DMA
   xQueueReset(filaAudio);
-  gravando = true;
+  chunksDescartados = 0;
+  falhasEnvio = 0;
+  gravando = true;                // a tarefaEnvioAudio percebe e envia start_audio
   estado = GRAVANDO;
-  wsEnviarTXT("start_audio");
 }
 
 static void finalizarGravacao(float peso) {
   Serial.printf("[GATO] Saiu da caixa (%.1f g). Finalizando gravação.\n", peso);
-  gravando = false;
-  vTaskDelay(pdMS_TO_TICKS(50)); // deixa a captura terminar o chunk em andamento
-
-  ChunkAudio chunk;
-  while (xQueueReceive(filaAudio, &chunk, 0) == pdTRUE) {
-    wsEnviarChunk(chunk);
-  }
-  wsEnviarTXT("stop_audio");
+  fimGravacaoMs = millis();
+  gravando = false;               // a tarefaEnvioAudio esvazia a fila e envia stop_audio
   estado = LIVRE;
+  Serial.printf("[AUDIO] Chunks descartados: %lu | falhas de envio: %lu\n",
+                (unsigned long)chunksDescartados, (unsigned long)falhasEnvio);
 }
 
 // Avalia uma leitura de peso (histerese 200 g / 100 g)
@@ -233,51 +308,43 @@ static void tratarPresenca(float peso) {
   }
 }
 
-// Envia o áudio acumulado. Bloqueia até 20 ms esperando o primeiro chunk
-// (acorda assim que ele chega) e depois esvazia o que mais houver na fila.
-static void enviarAudioPendente() {
-  ChunkAudio chunk;
-  TickType_t espera = pdMS_TO_TICKS(20);
-  while (xQueueReceive(filaAudio, &chunk, espera) == pdTRUE) {
-    wsEnviarChunk(chunk);
-    espera = 0;
-  }
-}
-
 void tarefaGerenciamentoCaixa(void *parametro) {
   float peso;
-
   for (;;) {
-    if (estado == LIVRE) {
-      // Nada a fazer até chegar uma leitura nova de peso
-      xQueueReceive(filaPeso, &peso, portMAX_DELAY);
-      tratarPresenca(peso);
-    } else {
-      // Se o WebSocket reconectou no meio da gravação, abre um novo arquivo no servidor
-      if (wsNovaConexao) {
-        wsNovaConexao = false;
-        wsEnviarTXT("start_audio");
-      }
-      enviarAudioPendente();
-      while (xQueueReceive(filaPeso, &peso, 0) == pdTRUE) {
-        tratarPresenca(peso);
-      }
-    }
+    // Dorme até chegar uma leitura nova de peso
+    xQueueReceive(filaPeso, &peso, portMAX_DELAY);
+    tratarPresenca(peso);
   }
 }
 
 // ---------------------------------------------------------------------
 //  Leitura da célula de carga
 // ---------------------------------------------------------------------
+// Média de PESO_AMOSTRAS leituras. Espera o HX711 ficar pronto DORMINDO (delay de 5 ms),
+// em vez do busy-wait interno do get_units(N), que ocuparia a CPU e atrasaria o WebSocket.
+static bool lerPeso(float &peso) {
+  float soma = 0;
+  for (int i = 0; i < PESO_AMOSTRAS; i++) {
+    if (!scale.wait_ready_timeout(1000, 5)) return false;
+    soma += scale.get_units(1);
+  }
+  peso = soma / PESO_AMOSTRAS;
+  return true;
+}
+
 void tarefaPeso(void *parametro) {
   for (;;) {
-    // Espera o HX711 ficar pronto (até 1 s). O "5" cede a CPU entre as checagens.
-    if (scale.wait_ready_timeout(1000, 5)) {
-      float peso = scale.get_units(PESO_AMOSTRAS);
+    float peso;
+    if (lerPeso(peso)) {
       if (fabsf(peso) < ZERO_THRESHOLD) {
         peso = 0.0f;
       }
-      xQueueSend(filaPeso, &peso, 0); // se a fila encher, descarta a leitura
+      if (xQueueSend(filaPeso, &peso, 0) != pdTRUE) {
+        // fila cheia: descarta a leitura mais antiga, para o gerenciamento nunca ver dado velho
+        float velho;
+        xQueueReceive(filaPeso, &velho, 0);
+        xQueueSend(filaPeso, &peso, 0);
+      }
     } else {
       Serial.println("HX711 não encontrado ou desconectado.");
     }
@@ -317,7 +384,7 @@ void tarefaTemperatura(void *parametro) {
 }
 
 // ---------------------------------------------------------------------
-//  setup / super loop
+//  setup / loop
 // ---------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
@@ -337,6 +404,7 @@ void setup() {
 
   // ----- WiFi -----
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false); // sem economia de energia do rádio: evita picos de latência que travam o envio do áudio
   WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_SENHA);
   Serial.print("Conectando ao WiFi");
@@ -351,27 +419,23 @@ void setup() {
     Serial.println("\nSem WiFi ainda (o driver continuará tentando em segundo plano).");
   }
 
-  // ----- Filas, mutex e I2S -----
-  wsMutex   = xSemaphoreCreateMutex();
+  // ----- Filas e I2S -----
   filaAudio = xQueueCreate(FILA_AUDIO_TAMANHO, sizeof(ChunkAudio));
   filaPeso  = xQueueCreate(FILA_PESO_TAMANHO, sizeof(float));
   i2sInstalar();
 
   // ----- WebSocket -----
-  webSocket.begin(WS_HOST, WS_PORT, WS_PATH);
-  webSocket.onEvent(webSocketEvent);
-  webSocket.setReconnectInterval(5000);
+  wsIniciar();
 
   // ----- Tarefas (o ESP32-C3 tem um único núcleo) -----
   xTaskCreate(tarefaCapturaAudio,       "CapturaAudio", 6144, NULL, 3, NULL);
-  xTaskCreate(tarefaGerenciamentoCaixa, "GerCaixa",     6144, NULL, 2, NULL);
+  xTaskCreate(tarefaEnvioAudio,         "EnvioAudio",   6144, NULL, 2, NULL);
+  xTaskCreate(tarefaGerenciamentoCaixa, "GerCaixa",     4096, NULL, 2, NULL);
   xTaskCreate(tarefaPeso,               "LeituraPeso",  4096, NULL, 1, NULL);
   xTaskCreate(tarefaTemperatura,        "LeituraTemp",  4096, NULL, 1, NULL);
 }
 
 void loop() {
-  xSemaphoreTake(wsMutex, portMAX_DELAY);
-  webSocket.loop();
-  xSemaphoreGive(wsMutex);
-  vTaskDelay(pdMS_TO_TICKS(1));
+  // Tudo roda em tarefas; o loop() não tem mais o que fazer.
+  vTaskDelay(pdMS_TO_TICKS(1000));
 }
