@@ -1,6 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
-#include "esp_websocket_client.h"   // cliente WebSocket oficial do ESP-IDF (tarefa própria, thread-safe)
+#include "esp_websocket_client.h"
 #include <driver/i2s.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -18,6 +18,7 @@ const char* WS_PATH    = "/ws/caixa_areia";
 #define WS_PING_INTERVALO_S   5      // heartbeat: detecta conexão "morta" em poucos segundos
 #define WS_PING_TIMEOUT_S     10
 #define WS_TIMEOUT_ENVIO_MS   500    // quanto um envio pode esperar antes de ser considerado falha
+#define INTERVALO_TELEMETRIA_MS 2000 // período de envio do pacote JSON de telemetria
 
 // ---------- HX711 ----------
 const int   LOADCELL_DOUT_PIN = 4;
@@ -71,6 +72,14 @@ volatile uint32_t wsConexoes = 0;           // incrementa a cada (re)conexão
 volatile uint32_t fimGravacaoMs = 0;        // instante em que gravando virou false
 volatile uint32_t chunksDescartados = 0;    // diagnóstico: chunks perdidos por fila cheia
 volatile uint32_t falhasEnvio = 0;          // diagnóstico: chunks que a rede recusou
+
+// Últimos valores medidos (escritos pelas tarefas de sensor, lidos pela telemetria).
+// Cada "Valido" vira false quando o sensor falha, e o JSON envia null no lugar do valor.
+volatile float pesoAtual = 0.0f;
+volatile bool  pesoValido = false;
+volatile float temperaturaAtual = 0.0f;
+volatile float umidadeAtual = 0.0f;
+volatile bool  ahtValido = false;
 
 enum EstadoCaixa { LIVRE, GRAVANDO };
 
@@ -339,6 +348,8 @@ void tarefaPeso(void *parametro) {
       if (fabsf(peso) < ZERO_THRESHOLD) {
         peso = 0.0f;
       }
+      pesoAtual = peso;
+      pesoValido = true;
       if (xQueueSend(filaPeso, &peso, 0) != pdTRUE) {
         // fila cheia: descarta a leitura mais antiga, para o gerenciamento nunca ver dado velho
         float velho;
@@ -346,6 +357,7 @@ void tarefaPeso(void *parametro) {
         xQueueSend(filaPeso, &peso, 0);
       }
     } else {
+      pesoValido = false;
       Serial.println("HX711 não encontrado ou desconectado.");
     }
     vTaskDelay(pdMS_TO_TICKS(1));
@@ -365,6 +377,7 @@ void tarefaTemperatura(void *parametro) {
         Serial.println("[AHT10] Sensor inicializado.");
       } else {
         Serial.println("[AHT10] Não encontrado. Tentando novamente...");
+        ahtValido = false;
         vTaskDelay(pdMS_TO_TICKS(5000));
         continue;
       }
@@ -372,14 +385,54 @@ void tarefaTemperatura(void *parametro) {
 
     sensors_event_t umidade, temperatura;
     if (aht.getEvent(&umidade, &temperatura)) {
+      temperaturaAtual = temperatura.temperature;
+      umidadeAtual = umidade.relative_humidity;
+      ahtValido = true;
       Serial.printf("[AHT10] Temperatura: %.1f °C | Umidade: %.1f %%\n",
                     temperatura.temperature, umidade.relative_humidity);
     } else {
       Serial.println("[AHT10] Falha na leitura.");
+      ahtValido = false;
       sensorOk = false; // força reinicialização na próxima volta
     }
 
     vTaskDelay(pdMS_TO_TICKS(INTERVALO_LEITURA_AHT_MS));
+  }
+}
+
+static void formatarNumero(char *dst, size_t n, bool valido, float v, int casas) {
+  if (valido && !isnan(v)) snprintf(dst, n, "%.*f", casas, v);
+  else                     snprintf(dst, n, "null");
+}
+
+static int montarTelemetria(char *buf, size_t n) {
+  // Copia local: os valores podem mudar durante a montagem
+  bool pv = pesoValido, av = ahtValido, gato = gravando;
+  float p = pesoAtual, t = temperaturaAtual, u = umidadeAtual;
+
+  char sp[16], st[16], su[16];
+  formatarNumero(sp, sizeof(sp), pv, p, 2);
+  formatarNumero(st, sizeof(st), av, t, 1);
+  formatarNumero(su, sizeof(su), av, u, 1);
+
+  return snprintf(buf, n,
+    "{\"tipo\":\"telemetria\",\"peso_g\":%s,\"temperatura_c\":%s,\"umidade_pct\":%s,"
+    "\"gato_presente\":%s,\"uptime_s\":%lu}",
+    sp, st, su, gato ? "true" : "false", (unsigned long)(millis() / 1000));
+}
+
+void tarefaTelemetria(void *parametro) {
+  char json[192];
+  TickType_t ultimoEnvio = xTaskGetTickCount();
+
+  for (;;) {
+    vTaskDelayUntil(&ultimoEnvio, pdMS_TO_TICKS(INTERVALO_TELEMETRIA_MS)); // cadência fixa, sem acumular atraso
+    if (!wsConectado) continue;
+
+    int tam = montarTelemetria(json, sizeof(json));
+    if (tam > 0 && tam < (int)sizeof(json)) {
+      wsEnviarTXT(json); // se falhar, o próximo pacote sai no próximo ciclo
+    }
   }
 }
 
@@ -433,6 +486,7 @@ void setup() {
   xTaskCreate(tarefaGerenciamentoCaixa, "GerCaixa",     4096, NULL, 2, NULL);
   xTaskCreate(tarefaPeso,               "LeituraPeso",  4096, NULL, 1, NULL);
   xTaskCreate(tarefaTemperatura,        "LeituraTemp",  4096, NULL, 1, NULL);
+  xTaskCreate(tarefaTelemetria,         "Telemetria",   4096, NULL, 1, NULL);
 }
 
 void loop() {
