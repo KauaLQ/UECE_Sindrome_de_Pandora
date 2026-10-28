@@ -141,8 +141,9 @@ flowchart LR
 | | L/R | `GND` | Seleciona o canal **esquerdo** (o firmware lê o canal 0) |
 | | VDD / GND | `3V3` / `GND` | |
 
-> ⚠️ **GPIO 0:** o driver I2S, por padrão, emite um sinal MCLK nesse pino. Como ele é usado como SDA do AHT10, o firmware força `mck_io_num = I2S_PIN_NO_CHANGE`.
-
+> [!WARNING]
+> **GPIO 0:** o driver I2S, por padrão, emite um sinal MCLK nesse pino. Como ele é usado como SDA do AHT10, o firmware força `mck_io_num = I2S_PIN_NO_CHANGE`.
+> 
 > **Célula de carga → HX711:** as 4 fios da célula (normalmente vermelho = E+, preto = E−, branco = A−, verde = A+) vão nos bornes correspondentes do HX711. As cores podem variar entre fabricantes.
 
 ### 2.3 Ligações do ESP32-S3-CAM
@@ -307,7 +308,7 @@ Configurações editáveis no topo do arquivo: `WIFI_SSID`, `WIFI_PASS`, `TCP_PO
 Hoje existem **dois scripts independentes**, um para cada placa. Eles não compartilham código nem processo.
 
 > [!TIP]
-> 💡 **Evolução sugerida:** unificar os dois em um único serviço (por exemplo, um único app FastAPI que receba o WebSocket de áudio/telemetria **e** o stream da câmera, ou que exponha ambos numa interface/dashboard única).
+> **Evolução sugerida:** unificar os dois em um único serviço (por exemplo, um único app FastAPI que receba o WebSocket de áudio/telemetria **e** o stream da câmera, ou que exponha ambos numa interface/dashboard única).
 
 ### 5.1 `python/server.py` — recepção da caixa de areia (ESP32-C3)
 
